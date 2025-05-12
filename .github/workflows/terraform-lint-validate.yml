@@ -1,0 +1,314 @@
+name: Terraform Lint, Validate, and Security Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+    # Optional: Define inputs for manual runs if needed
+    # inputs:
+    #   logLevel:
+    #     description: 'Log level'     
+    #     required: true
+    #     default: 'warning' 
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write # Added for SARIF upload
+
+jobs:
+  lint-validate:
+    name: Lint, Validate
+    if: |-
+      github.event_name != 'push' || 
+      (github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      ########################
+      # TERRAFORM SETUP TASK #
+      ########################
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest 
+
+      #######################
+      # TERRAFORM INIT TASK #
+      #######################
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend=false
+        continue-on-error: true 
+
+      ######################
+      # TERRAFORM VALIDATE #
+      ######################
+
+      - name: Terraform Validate
+        id: validate
+        if: steps.init.outcome == 'success'
+        run: terraform validate
+
+      #########################
+      # TERRAFORM FORMAT TASK #
+      #########################
+
+      - name: Check Terraform Formatting
+        id: fmt
+        continue-on-error: true
+        run: terraform fmt -check -recursive
+
+      - name: DEBUG Values
+        run: |
+          echo "DEBUG: steps.fmt.outcome is ${{ steps.fmt.outcome }}"
+          echo "DEBUG: github.event_name is ${{ github.event_name }}"
+
+      - name: Auto-fix and PR if needed
+        if: steps.fmt.outcome == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'push')
+        run: |
+          BRANCH_SUFFIX="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          BRANCH="auto/terraform-fmt-$BRANCH_SUFFIX"
+          DEFAULT_BASE_BRANCH="main"
+          PR_BODY="This PR was created automatically to fix Terraform formatting issues. [skip ci]"
+
+          # Determine PR Title based on event type
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            PR_TITLE="chore: auto-format Terraform code for PR #${{ github.event.pull_request.number }}"
+            BASE_BRANCH=$(jq -r .pull_request.base.ref "$GITHUB_EVENT_PATH")
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            PR_TITLE="chore: auto-format Terraform code for push to ${{ github.ref_name }}"
+            BASE_BRANCH="$DEFAULT_BASE_BRANCH"
+          else
+            echo "Unsupported event type for PR title determination."
+            exit 1
+          fi
+
+          # Check for existing PR
+          # Search for PRs with the determined title and a head branch starting with auto/terraform-fmt- a more generic suffix from the current context.
+          # This is a bit tricky because the exact branch name includes a SHA.
+          # We will search by title and ensure the head_ref starts with the common prefix for auto-formatting branches.
+          EXISTING_PR_URL=$(gh pr list --state open --search "\"$PR_TITLE\" in:title repo:$GITHUB_REPOSITORY head:auto/terraform-fmt-" --json url -q '.[0].url')
+
+          if [ -n "$EXISTING_PR_URL" ]; then
+            echo "An open PR for these formatting changes already exists: $EXISTING_PR_URL"
+            echo "Skipping new PR creation."
+            exit 0 # Exit successfully if PR already exists
+          fi
+
+          echo "No existing open PR found for these formatting changes. Proceeding to create one."
+          git checkout -b $BRANCH
+          terraform fmt -recursive
+          git config --local user.email "automation@buungroup.com"
+          git config --local user.name "Buun Group Automation [Bot]"
+          git add .
+          git commit -m "style: Auto-format Terraform code [skip ci]"
+          # Force push might be needed if the branch already exists from a previous failed run and re-run
+          git push origin $BRANCH --force 
+
+          # Create PR using GitHub CLI
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            gh pr comment ${{ github.event.pull_request.number }} --body "Auto-formatting PR created: $BRANCH. Please review and merge the formatting fixes. This PR will be auto-merged if all checks pass."
+          elif [ "${{ github.event_name }}" == "push" ]; then # Create PR for any push event with formatting issues
+            gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base "$DEFAULT_BASE_BRANCH" --head "$BRANCH"
+            echo "Auto-formatting PR created from $BRANCH to $DEFAULT_BASE_BRANCH for push to ${{ github.ref_name }}."
+          else
+            echo "Skipping PR creation: Not a pull_request or push event."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  security_scan_trivy:
+    name: Security Scan (Trivy IaC)
+    runs-on: ubuntu-latest
+    needs: [lint-validate] # Optional: run after lint-validate or in parallel
+    if: |- # Run under the same conditions as lint-validate, adjust if needs: lint-validate is used
+      (always() && (needs.lint-validate.result == 'success' || needs.lint-validate.result == 'skipped')) &&
+      (github.event_name != 'push' || 
+      (github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[skip ci]')))
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with: # Ensure we checkout the PR's code if this is a PR event
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install wget apt-transport-https gnupg lsb-release -y
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
+          trivy --version
+
+      - name: Run Trivy IaC scan for SARIF
+        run: trivy config . --format sarif --output trivy-iac-results.sarif --exit-code 0 # Use exit-code 0 to not fail here, will check later
+      
+      - name: Upload Trivy IaC SARIF
+        if: success() || failure() # Always try to upload if the file exists
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-iac-results.sarif
+          category: trivy-iac
+
+      - name: Run Trivy IaC scan for PR Comment
+        id: trivy_pr_comment_run
+        run: |
+          trivy config . --format table --severity CRITICAL,HIGH,MEDIUM > trivy_comment_body.md || echo "TRIVY_EXIT_CODE=$?" >> $GITHUB_ENV
+          if [ -z "$TRIVY_EXIT_CODE" ]; then TRIVY_EXIT_CODE=0; fi
+          # Trivy exit codes: 0 if no issues, 1 if issues found (for config scans with --exit-code 1 explicitly)
+          # For PR comment, we capture output regardless of exit code from this specific command, but rely on a separate scan or logic to determine failure
+          # Re-run with exit-code 1 to determine if there are issues for the failure step
+          trivy config . --exit-code 1 --severity CRITICAL,HIGH,MEDIUM > /dev/null || echo "TRIVY_HAS_ISSUES=true" >> $GITHUB_ENV
+          
+          echo "TRIVY_FINAL_EXIT_CODE=${TRIVY_EXIT_CODE}" >> $GITHUB_ENV # This is from the table output, might not be what we want for failure
+          FINAL_FAILURE_EXIT_CODE=0
+          if [ "${TRIVY_HAS_ISSUES}" == "true" ]; then FINAL_FAILURE_EXIT_CODE=1; fi
+          echo "TRIVY_ACTUAL_FAILURE_CODE=$FINAL_FAILURE_EXIT_CODE" >> $GITHUB_ENV
+          
+          comment_content=$(cat trivy_comment_body.md)
+          # Check if the comment_content is just the header or empty
+          # Count lines, if it's 1 or 2 (header only, or header + empty line), assume no issues for comment
+          num_lines=$(echo "$comment_content" | wc -l)
+          if [ "$FINAL_FAILURE_EXIT_CODE" -eq 0 ] || [ "$num_lines" -le 2 ]; then
+            echo "Trivy found no issues or output is effectively empty for comment."
+            echo "TRIVY_COMMENT_NEEDED=false" >> $GITHUB_OUTPUT
+          else
+            echo "TRIVY_COMMENT_NEEDED=true" >> $GITHUB_OUTPUT
+            echo "TRIVY_COMMENT_BODY_B64=$(echo "$comment_content" | base64 -w 0)" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Post Trivy IaC Comment on PR
+        if: steps.trivy_pr_comment_run.outputs.TRIVY_COMMENT_NEEDED == 'true' && github.event_name == 'pull_request' && env.TRIVY_ACTUAL_FAILURE_CODE != '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            if (!prNumber) {
+              console.log('Not a pull request. Skipping comment.');
+              return;
+            }
+            const bodyContentB64 = '${{ steps.trivy_pr_comment_run.outputs.TRIVY_COMMENT_BODY_B64 }}';
+            const bodyContent = Buffer.from(bodyContentB64, 'base64').toString('utf-8');
+            
+            let finalComment = `## :shield: Trivy IaC Scan Results :shield:\\n\\n**Detected vulnerabilities/misconfigurations:**\\n\\n\`\`\`markdown\\n${bodyContent}\\n\`\`\``;
+            
+            const MAX_COMMENT_LENGTH = 65000; 
+            if (finalComment.length > MAX_COMMENT_LENGTH) {
+              const codeBlockPadding = "## :shield: Trivy IaC Scan Results :shield:\\n\\n**Detected vulnerabilities/misconfigurations:**\\n\\n```markdown\\n\\n```".length;
+              const truncationMessage = "\\n\\n**Note:** The full Trivy output was too long and has been truncated. Please check the workflow logs or the SARIF upload in the Security tab for all details.";
+              const allowedBodyLength = MAX_COMMENT_LENGTH - codeBlockPadding - truncationMessage.length;
+              finalComment = finalComment.substring(0, allowedBodyLength) + truncationMessage;
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: finalComment
+            });
+            console.log(`Commented on PR #${prNumber} with Trivy IaC results.`);
+
+      - name: Trivy IaC Check Fail
+        if: env.TRIVY_ACTUAL_FAILURE_CODE != '0'
+        run: |
+          echo "Trivy IaC scan found vulnerabilities or misconfigurations. Failing the workflow."
+          exit 1
+
+  security_scan_checkov:
+    name: Security Scan (Checkov)
+    runs-on: ubuntu-latest
+    needs: [lint-validate] # Optional: run after lint-validate or in parallel
+    if: |- # Run under the same conditions as lint-validate, adjust if needs: lint-validate is used
+      (always() && (needs.lint-validate.result == 'success' || needs.lint-validate.result == 'skipped')) &&
+      (github.event_name != 'push' || 
+      (github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[skip ci]')))
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' 
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov for SARIF
+        run: checkov --directory . --framework terraform --output sarif --output-file-path checkov-results.sarif --soft-fail 
+
+      - name: Upload Checkov SARIF
+        if: success() || failure() # Always try to upload
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+          
+      - name: Run Checkov for PR Comment
+        id: checkov_pr_comment_run
+        run: |
+          checkov --directory . --framework terraform -o cli > checkov_comment_body.txt 2>&1 || CHECKOV_EXIT_CODE=$?
+          if [ -z "$CHECKOV_EXIT_CODE" ]; then CHECKOV_EXIT_CODE=0; fi 
+          echo "CHECKOV_FINAL_EXIT_CODE=$CHECKOV_EXIT_CODE" >> $GITHUB_ENV
+
+          if [ "$CHECKOV_EXIT_CODE" -ne 0 ]; then
+            echo "Checkov found issues."
+            comment_content=$(cat checkov_comment_body.txt)
+            echo "CHECKOV_COMMENT_NEEDED=true" >> $GITHUB_OUTPUT
+            echo "CHECKOV_COMMENT_BODY_B64=$(echo "$comment_content" | base64 -w 0)" >> $GITHUB_OUTPUT
+          else
+            echo "Checkov found no issues."
+            echo "CHECKOV_COMMENT_NEEDED=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Checkov Comment on PR
+        if: steps.checkov_pr_comment_run.outputs.CHECKOV_COMMENT_NEEDED == 'true' && github.event_name == 'pull_request' && env.CHECKOV_FINAL_EXIT_CODE != '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            if (!prNumber) {
+              console.log('Not a pull request. Skipping comment.');
+              return;
+            }
+            const bodyContentB64 = '${{ steps.checkov_pr_comment_run.outputs.CHECKOV_COMMENT_BODY_B64 }}';
+            const bodyContent = Buffer.from(bodyContentB64, 'base64').toString('utf-8');
+            
+            let finalComment = `## :mag: Checkov Scan Results :mag:\\n\\n\`\`\`\\n${bodyContent}\\n\`\`\``;
+
+            const MAX_COMMENT_LENGTH = 65000;
+            if (finalComment.length > MAX_COMMENT_LENGTH) {
+              const codeBlockPadding = "## :mag: Checkov Scan Results :mag:\\n\\n```\\n\\n```".length;
+              const truncationMessage = "\\n\\n**Note:** The full Checkov output was too long and has been truncated. Please check the workflow logs or the SARIF upload in the Security tab for all details.";
+              const allowedContentLength = MAX_COMMENT_LENGTH - codeBlockPadding - truncationMessage.length;
+              const truncatedBody = bodyContent.substring(0, allowedContentLength);
+              finalComment = `## :mag: Checkov Scan Results :mag:\\n\\n\`\`\`\\n${truncatedBody}\\n\`\`\`${truncationMessage}`;
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: finalComment
+            });
+            console.log(`Commented on PR #${prNumber} with Checkov results.`);
+
+      - name: Checkov Check Fail
+        if: env.CHECKOV_FINAL_EXIT_CODE != '0'
+        run: |
+          echo "Checkov found vulnerabilities. Failing the workflow."
+          exit 1

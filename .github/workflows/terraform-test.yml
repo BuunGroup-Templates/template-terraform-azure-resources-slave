@@ -1,0 +1,184 @@
+name: 'Terraform Tests'
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect-topics:
+    runs-on: ubuntu-latest
+    outputs:
+      is_slave: ${{ steps.topics.outputs.is_slave }}
+      is_master: ${{ steps.topics.outputs.is_master }}
+    steps:
+      - name: Get repository topics
+        id: topics
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const topics = repo.topics || [];
+            core.info(`Repo topics: ${topics.join(', ')}`);
+            core.setOutput('is_slave', topics.includes('template-slave'));
+            core.setOutput('is_master', topics.includes('template-master'));
+
+  unit_tests:
+    name: 'Terraform Unit Tests'
+    needs: detect-topics
+    if: needs.detect-topics.outputs.is_slave == 'true' || needs.detect-topics.outputs.is_master == 'true'
+    runs-on: ubuntu-latest
+    
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Root Directory Structure
+        run: ls -al
+
+      - name: Copy test files to tests/
+        run: |
+          cp -r tests/unit_tests/* tests/ 2>/dev/null || true
+
+      - name: List tests directory contents
+        run: ls -al tests
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest 
+
+      - name: Show Terraform Version
+        run: terraform version
+
+      - name: Run Terraform Init
+        id: init
+        working-directory: .
+        continue-on-error: false
+        run: |
+          terraform init -backend=false
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Run Terraform Tests
+        id: test
+        working-directory: .
+        continue-on-error: false
+        run: |
+          terraform test
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+
+      - name: Update PR with Test Results
+        if: github.event_name == 'pull_request' && (success() || failure())
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const testOutcome = ${{ steps.test.outcome == 'success' }} ? '✅' : '❌';
+            const testSummary = `### Terraform Test Results\n${testOutcome} Tests ${steps.test.outcome}\n`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.name,
+              body: testSummary
+            });
+
+  integration_tests:
+    name: 'Terraform Integration Tests'
+    needs: detect-topics
+    if: needs.detect-topics.outputs.is_master == 'true'
+    runs-on: ubuntu-latest
+    
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Root Directory Structure
+        run: ls -al
+
+      - name: Copy test files to tests/
+        run: |
+          cp -r tests/intergration_tests/* tests/ 2>/dev/null || true
+          cp -r tests/examples/* tests/ 2>/dev/null || true
+
+      - name: List tests directory contents
+        run: ls -al tests
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest 
+
+      - name: Show Terraform Version
+        run: terraform version
+
+      - name: Run Terraform Init
+        id: init
+        working-directory: .
+        continue-on-error: false
+        run: |
+          terraform init -backend=false
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Run Terraform Tests
+        id: test
+        working-directory: .
+        continue-on-error: false
+        run: |
+          terraform test
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Update PR with Test Results
+        if: github.event_name == 'pull_request' && (success() || failure())
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const testOutcome = ${{ steps.test.outcome == 'success' }} ? '✅' : '❌';
+            const testSummary = `### Terraform Test Results\n${testOutcome} Tests ${steps.test.outcome}\n`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.name,
+              body: testSummary
+            }); 

@@ -1,0 +1,157 @@
+name: Auto Merge Terraform Format PRs
+
+on:
+  workflow_run:
+    workflows: ["Terraform Lint, Validate, and Security Scan", "Generate Terraform Docs", "Terraform Plan and Apply"]
+    types:
+      - completed
+    branches:
+      - 'auto/terraform-fmt-*'
+      - 'auto/terraform-docs-*'
+      - main
+
+#checkov:skip=CKV2_GHA_1:Workflow requires write permissions to merge PRs and manage branches
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  debug-event:
+    name: Debug Workflow Run Event
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump workflow_run event context
+        env:
+          WORKFLOW_RUN_EVENT: ${{ toJson(github.event.workflow_run) }}
+        run: |
+          echo "Workflow Run Event Details:"
+          echo "$WORKFLOW_RUN_EVENT"
+
+  automerge:
+    name: Auto Merge Formatting PR
+    needs: debug-event # Optional: run after debug if you want to ensure debug info is always first
+    if: |
+      github.event.workflow_run.conclusion == 'success' && # Ensure the triggering workflow was successful
+      (
+        (
+          github.event.workflow_run.pull_requests[0] != null &&
+          github.event.workflow_run.pull_requests[0].head.ref != null &&
+          (
+            startsWith(github.event.workflow_run.pull_requests[0].head.ref, 'auto/terraform-fmt-') ||
+            startsWith(github.event.workflow_run.pull_requests[0].head.ref, 'auto/terraform-docs-')
+          )
+        ) ||
+        (
+          github.event.workflow_run.pull_requests[0] == null &&
+          github.event.workflow_run.head_branch != null &&
+          (
+            startsWith(github.event.workflow_run.head_branch, 'auto/terraform-fmt-') ||
+            startsWith(github.event.workflow_run.head_branch, 'auto/terraform-docs-')
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get PR Details
+        id: pr_details
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=""
+          PR_HEAD_SHA="${{ github.event.workflow_run.head_sha }}" # Use the consistent head SHA from workflow_run
+
+          if [ -n "${{ github.event.workflow_run.pull_requests[0].number }}" ]; then
+            PR_NUMBER="${{ github.event.workflow_run.pull_requests[0].number }}"
+            echo "PR number from workflow_run.pull_requests: $PR_NUMBER"
+          elif [[ "${{ github.event.workflow_run.head_branch }}" == auto/terraform-fmt-* || "${{ github.event.workflow_run.head_branch }}" == auto/terraform-docs-* ]]; then
+            echo "Attempting to find PR for branch: ${{ github.event.workflow_run.head_branch }}"
+            PR_NUMBER_CANDIDATE=$(gh pr list --head "${{ github.event.workflow_run.head_branch }}" --state open --limit 1 --json number --jq '.[0].number')
+            if [ -n "$PR_NUMBER_CANDIDATE" ] && [ "$PR_NUMBER_CANDIDATE" != "null" ]; then
+              PR_NUMBER="$PR_NUMBER_CANDIDATE"
+              echo "Found PR number via gh cli: $PR_NUMBER"
+            else
+              echo "No open PR found for branch ${{ github.event.workflow_run.head_branch }}."
+            fi
+          else
+            echo "Not a relevant PR event or auto-branch push for PR discovery."
+          fi
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "pr_number_found=false" >> $GITHUB_OUTPUT
+            echo "::warning::Could not determine a relevant PR number." # Use warning instead of error to allow job to finish if no PR
+          else
+            echo "pr_number_found=true" >> $GITHUB_OUTPUT
+          fi
+          echo "pr_number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+          echo "pr_head_sha=${PR_HEAD_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Wait for status checks and ensure PR is mergeable
+        id: wait_for_checks
+        if: steps.pr_details.outputs.pr_number_found == 'true'
+        uses: lewagon/wait-on-check-action@v1.3.1
+        with:
+          ref: ${{ steps.pr_details.outputs.pr_head_sha }}
+          check-name: 'automerge'
+          wait-interval: 10
+          running-workflow-name: 'Auto Merge Terraform Format PRs'
+          allowed-conclusions: success,skipped,neutral
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Double check mergeability via API
+        if: steps.pr_details.outputs.pr_number_found == 'true' && steps.wait_for_checks.outputs.conclusion == 'success'
+        id: check_mergeable_api
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const prNumberString = '${{ steps.pr_details.outputs.pr_number }}';
+            if (!prNumberString) {
+              core.setFailed('PR number is not available.');
+              return 'false';
+            }
+            const prNumber = parseInt(prNumberString, 10);
+            if (isNaN(prNumber)) {
+              core.setFailed(`Invalid PR number: ${prNumberString}`);
+              return 'false';
+            }
+
+            core.info(`Checking mergeability for PR #${prNumber}`);
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.data.state !== 'open') {
+              core.setFailed(`PR #${prNumber} is not open. State: ${pr.data.state}`);
+              return 'false';
+            }
+
+            if (pr.data.mergeable_state === 'clean') {
+              core.info(`PR #${prNumber} is clean and mergeable.`);
+              return 'true';
+            } else {
+              core.setFailed(`PR #${prNumber} is not in a clean mergeable state via API: ${pr.data.mergeable_state}`);
+              return 'false';
+            }
+
+      - name: Merge PR
+        if: steps.pr_details.outputs.pr_number_found == 'true' && steps.wait_for_checks.outputs.conclusion == 'success' && steps.check_mergeable_api.outputs.result == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_details.outputs.pr_number }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            echo "Error: PR_NUMBER is not set."
+            exit 1
+          fi
+          echo "Attempting to merge PR #$PR_NUMBER"
+          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
+          echo "PR #$PR_NUMBER merged and branch deleted." 
