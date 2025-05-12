@@ -13,6 +13,6 @@
 #################################################################
 
 module "example_root_module_1" {
-  source = "../../"
+  source          = "../../"
   greeting_prefix = "Example Greeting 1"
 }
