@@ -13,5 +13,5 @@
 #################################################################
 
 locals {
-    # This is a local variable that is used to store configuration
+  # This is a local variable that is used to store configuration
 }
